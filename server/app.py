@@ -9,6 +9,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import JSONResponse
 
+# Add parent directory to path if running directly
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+
 from wellness_env import WellnessEnv
 from wellness_env.models import Action
 
@@ -65,6 +70,10 @@ def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-if __name__ == "__main__":
+def main():
     port = int(os.environ.get("PORT", "7860"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    main()
