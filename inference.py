@@ -19,8 +19,6 @@ sys.path.append(str(Path(__file__).parent))
 
 from wellness_env import WellnessEnv, Action, Observation
 from wellness_env.models import SleepDuration, ExerciseType, NutritionType, Goal
-from dotenv import load_dotenv
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # LLM client setup
