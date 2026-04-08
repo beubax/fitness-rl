@@ -6,7 +6,7 @@ import os
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import JSONResponse
 
 from wellness_env import WellnessEnv
@@ -19,7 +19,7 @@ _env = WellnessEnv(seed=int(os.environ.get("SEED", "42")))
 
 
 @app.post("/reset")
-def reset(body: dict[str, Any]) -> JSONResponse:
+def reset(body: dict[str, Any] = Body({})) -> JSONResponse:
     """Start a new episode. Body: {"task_name": "single_goal"}"""
     task_name = body.get("task_name", "single_goal")
     try:
