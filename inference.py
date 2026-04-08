@@ -11,11 +11,16 @@ import json
 import os
 import sys
 import traceback
+from pathlib import Path
 from typing import Any
+
+# Ensure wellness_env is importable without pip install -e .
+sys.path.append(str(Path(__file__).parent))
 
 from wellness_env import WellnessEnv, Action, Observation
 from wellness_env.models import SleepDuration, ExerciseType, NutritionType, Goal
-from wellness_env.payoff import _linear_slope, _stddev
+from dotenv import load_dotenv
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # LLM client setup
@@ -27,46 +32,96 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", HF_TOKEN)
 
 SYSTEM_PROMPT = """\
-You are a wellness decision system. Follow these EXACT rules to choose actions.
+You are an AI wellness coach controlling a day-by-day health simulation.
+Your goal is to maximize the reward signal by choosing daily actions that improve
+a simulated person's biomarkers over the course of the episode.
 
-## SLEEP RULES (pick ONE):
-1. If cortisol > 65 OR energy < 30 → "8_to_9h"
-2. If compliance_rate <= 0.3 → "7_to_8h"
-3. If goal is stress_management → "8_to_9h"
-4. If goal is athletic_performance AND HRV dropped (hrv_delta < -2) → "8_to_9h"
-5. Default → "7_to_8h"
+## Environment
+- Each episode lasts a fixed number of days. Each step = 1 day.
+- The person has a primary **goal** (e.g. weight_loss, athletic_performance, stress_management, muscle_gain, longevity, overall_wellness). Reward is weighted toward biomarkers relevant to that goal.
+- The person has a **compliance_rate** — they may not always follow your recommendation. You cannot control this, but you can adapt.
+- Random life events (bad sleep, missed exercise, social dinners) can override your action ~5% of the time.
 
-## EXERCISE RULES (pick ONE):
-1. If cortisol > 65 OR energy < 30 → "yoga"
-2. If compliance_rate <= 0.3 → "light_cardio"
-3. If goal is athletic_performance AND HRV dropped (hrv_delta < -2) → "yoga"
-4. If goal is athletic_performance → alternate "hiit" on odd days, "strength" on even days
-5. If goal is muscle_gain → "strength"
-6. If goal is stress_management → "yoga"
-7. If goal is weight_loss → "moderate_cardio" if energy > 50, else "light_cardio"
-8. Default → "moderate_cardio"
+## Action Space (pick exactly one from each category)
+Sleep: "less_than_6h", "6_to_7h", "7_to_8h", "8_to_9h", "more_than_9h"
+Exercise: "none", "light_cardio", "moderate_cardio", "hiit", "strength", "yoga"
+Nutrition: "high_protein", "balanced", "high_carb", "processed", "skipped"
 
-## NUTRITION RULES (pick ONE):
-1. If goal is athletic_performance OR muscle_gain → "high_protein"
-2. If goal is stress_management → "balanced"
-3. If goal is weight_loss → "balanced"
-4. Default → "balanced"
+## Biomarkers you observe
+- resting_hr (lower=better), hrv (higher=better), vo2_max (higher=better)
+- body_fat_pct (lower=better), lean_mass_kg (higher=better)
+- sleep_efficiency (higher=better), cortisol_proxy (lower=better, 0-100), energy_level (higher=better, 0-100)
 
-## OUTPUT: JSON only, no markdown:
+## Reward
+- Reward is computed from biomarker *changes* (deltas) weighted by the goal, blended with absolute state quality.
+- Baseline reward is ~50. Improvements push above 50, regressions push below.
+- Watch for overtraining: too many consecutive intense exercise days can backfire.
+- Sleep debt accumulates and reduces exercise effectiveness.
+
+## Strategy hints
+- Use the action history and reward feedback to identify what works for this persona.
+- If a biomarker is worsening, try changing the relevant action.
+- Balance short-term intensity with recovery.
+
+## OUTPUT: Respond with ONLY a JSON object, no markdown fences:
 {"sleep": "...", "exercise": "...", "nutrition": "..."}
 """
 
 
-def build_user_message(obs: Observation, step_num: int) -> str:
-    """Build minimal user message with only decision-relevant inputs."""
+def build_user_message(obs: Observation, step_num: int, history_actions: list[dict]) -> str:
+    """Build user message with current state and action history."""
     b = obs.biomarkers
     d = obs.deltas
-    return (
-        f"day={step_num} total={obs.total_days} goal={obs.goal.value} "
-        f"compliance={obs.compliance_rate}\n"
-        f"cortisol={b.cortisol_proxy:.1f} energy={b.energy_level:.1f} "
-        f"hrv_delta={d.hrv:+.2f}"
-    )
+
+    # Current state
+    lines = [
+        f"Day {step_num}/{obs.total_days} | Goal: {obs.goal.value} | Compliance rate: {obs.compliance_rate:.0%}",
+        "",
+        "Current biomarkers:",
+        f"  resting_hr={b.resting_hr:.1f}  hrv={b.hrv:.1f}  vo2_max={b.vo2_max:.2f}",
+        f"  body_fat={b.body_fat_pct:.2f}%  lean_mass={b.lean_mass_kg:.2f}kg",
+        f"  sleep_eff={b.sleep_efficiency:.1f}%  cortisol={b.cortisol_proxy:.1f}  energy={b.energy_level:.1f}",
+        "",
+        "Deltas (change from yesterday):",
+        f"  resting_hr={d.resting_hr:+.3f}  hrv={d.hrv:+.3f}  vo2_max={d.vo2_max:+.4f}",
+        f"  body_fat={d.body_fat_pct:+.4f}  lean_mass={d.lean_mass_kg:+.4f}",
+        f"  sleep_eff={d.sleep_efficiency:+.3f}  cortisol={d.cortisol_proxy:+.3f}  energy={d.energy_level:+.3f}",
+    ]
+
+    # Trends if available
+    if obs.trends:
+        t = obs.trends
+        lines.extend([
+            "",
+            "7-day trends:",
+            f"  rhr_trend={t.resting_hr_trend:+.4f}  hrv_trend={t.hrv_trend:+.4f}  vo2_trend={t.vo2_max_trend:+.4f}",
+            f"  bf_trend={t.body_fat_trend:+.4f}  lm_trend={t.lean_mass_trend:+.4f}  se_trend={t.sleep_efficiency_trend:+.4f}",
+            f"  reward_trend={t.reward_trend:+.4f}  reward_consistency={t.reward_consistency:.4f}",
+        ])
+
+    # Action history (last 7 steps to stay within context limits)
+    if history_actions:
+        lines.extend(["", "Recent action history:"])
+        for h in history_actions[-7:]:
+            a = h["action"]
+            actual = h.get("actual", a)
+            complied = h.get("complied", True)
+            compliance_note = "" if complied else " [NOT FOLLOWED]"
+            lines.append(
+                f"  Day {h['step']}: sleep={a['sleep']} exercise={a['exercise']} "
+                f"nutrition={a['nutrition']} → reward={h['reward']:.2f}{compliance_note}"
+            )
+            if not complied:
+                lines.append(
+                    f"    (actual: sleep={actual['sleep']} exercise={actual['exercise']} "
+                    f"nutrition={actual['nutrition']})"
+                )
+    else:
+        lines.extend(["", "No action history yet (first day)."])
+
+    lines.append("")
+    lines.append("Choose your action for today.")
+    return "\n".join(lines)
 
 
 def call_llm(obs: Observation, step_num: int, history_actions: list[dict]) -> Action:
@@ -78,13 +133,13 @@ def call_llm(obs: Observation, step_num: int, history_actions: list[dict]) -> Ac
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_message(obs, step_num)},
+            {"role": "user", "content": build_user_message(obs, step_num, history_actions)},
         ]
 
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
-            temperature=0,
+            temperature=0.4,
             max_tokens=80,
         )
 
@@ -199,9 +254,7 @@ def run_task(env: WellnessEnv, task_name: str, use_llm: bool = True) -> None:
     persona = env._persona
 
     print(
-        f"[START] task={task_name} env=wellness-outcome model={MODEL_NAME} "
-        f"persona={persona.name} goal={persona.goal.value} "
-        f"compliance={persona.compliance_rate} days={config['total_days']}"
+        f"[START] task={task_name} env=wellness-outcome model={MODEL_NAME}"
     )
 
     rewards: list[float] = []
@@ -230,34 +283,13 @@ def run_task(env: WellnessEnv, task_name: str, use_llm: bool = True) -> None:
                 "reward": reward_val,
             })
 
-            # Compact biomarker snapshot
-            b = result.observation.biomarkers
-            bio_str = (
-                f"rhr={b.resting_hr},hrv={b.hrv},vo2={b.vo2_max},"
-                f"bf={b.body_fat_pct},lm={b.lean_mass_kg},"
-                f"se={b.sleep_efficiency},cortisol={b.cortisol_proxy},"
-                f"energy={b.energy_level}"
-            )
-
-            # Compact delta snapshot
-            dl = result.observation.deltas
-            delta_str = (
-                f"rhr={dl.resting_hr:+.3f},hrv={dl.hrv:+.3f},vo2={dl.vo2_max:+.4f},"
-                f"bf={dl.body_fat_pct:+.4f},lm={dl.lean_mass_kg:+.4f},"
-                f"se={dl.sleep_efficiency:+.3f},cortisol={dl.cortisol_proxy:+.3f},"
-                f"energy={dl.energy_level:+.3f}"
-            )
-
+            action_str = json.dumps(action_dict)
             print(
                 f"[STEP] step={step_num} "
-                f"action={json.dumps(action_dict)} "
+                f"action={action_str} "
                 f"reward={reward_val:.2f} "
                 f"done={str(result.done).lower()} "
-                f"error=null "
-                f"actual={json.dumps(actual_dict)} "
-                f"complied={str(complied).lower()} "
-                f"biomarkers={{{bio_str}}} "
-                f"deltas={{{delta_str}}}"
+                f"error=null"
             )
 
             obs = result.observation
@@ -273,30 +305,13 @@ def run_task(env: WellnessEnv, task_name: str, use_llm: bool = True) -> None:
 
     # End summary
     score = env.grade()
-    avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
-    reward_trend = _linear_slope(rewards) if len(rewards) >= 2 else 0.0
-    reward_std = _stddev(rewards)
-    actual_compliance = (
-        sum(1 for h in history_actions if h["complied"]) / len(history_actions)
-        if history_actions
-        else 0.0
-    )
+    success = score >= 0.1
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
 
-    # Biomarker summary: starting vs ending
-    st = env.state()
-    bio_start = env._history[0]["biomarkers"] if env._history else {}
-    bio_end = st.biomarkers.model_dump() if st.biomarkers else {}
-
     print(
-        f"[END] success=true steps={len(rewards)} "
-        f"score={score:.4f} "
-        f"rewards={rewards_str} "
-        f"task={task_name} avg_reward={avg_reward:.2f} "
-        f"reward_trend={reward_trend:+.2f} reward_stddev={reward_std:.2f} "
-        f"compliance_rate_actual={actual_compliance:.2f}"
+        f"[END] success={str(success).lower()} steps={len(rewards)} "
+        f"score={score:.2f} rewards={rewards_str}"
     )
-    print()
 
 
 def main():
@@ -315,10 +330,9 @@ def main():
             run_task(env, task_name, use_llm=use_llm)
         except Exception:
             print(
-                f"[END] success=false steps=0 score=0.0000 rewards= task={task_name}"
+                f"[END] success=false steps=0 score=0.00 rewards="
             )
             traceback.print_exc(file=sys.stderr)
-            print()
 
 
 if __name__ == "__main__":

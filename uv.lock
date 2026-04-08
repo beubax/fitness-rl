@@ -2823,6 +2823,7 @@ dependencies = [
     { name = "openai" },
     { name = "openenv-core" },
     { name = "pydantic" },
+    { name = "python-dotenv" },
     { name = "uvicorn" },
 ]
 
@@ -2839,6 +2840,7 @@ requires-dist = [
     { name = "openenv-core", specifier = ">=0.2.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "python-dotenv", specifier = ">=1.0" },
     { name = "uvicorn", specifier = ">=0.29.0" },
 ]
 provides-extras = ["dev"]
